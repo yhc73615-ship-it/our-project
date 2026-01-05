@@ -1,0 +1,9 @@
+test_bs128_sl96_dm16_df16_ln4_k2_embtimeF_ar3.0_lr0.0001_pt10_te15_bn1_0  
+Accuracy : 0.7608, Precision : 0.9934, Recall : 0.7000, F-score : 0.8213
+
+test_bs128_sl96_dm16_df16_ln4_k2_embtimeF_ar3.0_lr0.0001_pt10_te15_bn1_0  
+Accuracy : 0.7608, Precision : 0.9934, Recall : 0.7000, F-score : 0.8213
+
+test_bs128_sl96_dm16_df16_ln4_k2_embtimeF_ar3.0_lr0.001_pt10_te15_bn1_0  
+Accuracy : 0.7619, Precision : 0.9844, Recall : 0.7079, F-score : 0.8236
+
