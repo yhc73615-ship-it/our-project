@@ -54,6 +54,17 @@ if __name__ == '__main__':
     parser.add_argument('--batch_norm', type=int, default=1)
     parser.add_argument('--temp', type=int, default=2)
     parser.add_argument('--lambda_contrastive', type=float, default=0.1)
+    parser.add_argument('--use_diffusion', action='store_true', help='enable conditional diffusion decoder', default=False)
+    parser.add_argument('--diffusion_steps', type=int, default=100, help='number of diffusion timesteps')
+    parser.add_argument('--diffusion_beta_schedule', type=str, default='linear', help='beta schedule for diffusion (linear|cosine)')
+    parser.add_argument('--diffusion_beta_start', type=float, default=1e-4, help='starting beta for diffusion')
+    parser.add_argument('--diffusion_beta_end', type=float, default=2e-2, help='ending beta for diffusion')
+    parser.add_argument('--diffusion_dim', type=int, default=64, help='hidden dimension of diffusion decoder')
+    parser.add_argument('--diffusion_heads', type=int, default=4, help='number of attention heads in diffusion decoder')
+    parser.add_argument('--diffusion_depth', type=int, default=3, help='number of denoising blocks')
+    parser.add_argument('--diffusion_eval_step', type=int, default=50, help='timestep used for inference-time noising')
+    parser.add_argument('--lambda_diff', type=float, default=1.0, help='weight for diffusion noise prediction loss')
+    parser.add_argument('--lambda_rec', type=float, default=0.0, help='weight for conditional reconstruction head loss')
     
     # anomaly detection task
     parser.add_argument('--anomaly_ratio', type=float, default=3, help='prior anomaly ratio (%)')

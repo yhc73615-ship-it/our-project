@@ -7,10 +7,43 @@ $BATCH_SIZE = 128
 $TRAIN_EPOCHS = 15
 $LEARNING_RATE = 0.0001
 $DATA_ROOT = "./dataset/FD/"
+
+# Diffusion toggles (set $USE_DIFFUSION to $true to enable)
+$USE_DIFFUSION = $true
+$LAMBDA_DIFF = 1.0
+$LAMBDA_REC = 0.0
+$DIFF_STEPS = 100
+$DIFF_EVAL_STEP = 50
+$DIFF_DIM = 64
+$DIFF_HEADS = 4
+$DIFF_DEPTH = 3
+$DIFF_SCHEDULE = "linear"
+$DIFF_BETA_START = 0.0001
+$DIFF_BETA_END = 0.02
+
 if (-not (Test-Path $DATA_ROOT)) {
     Write-Host "Warning: Data directory $DATA_ROOT does not exist." -ForegroundColor Yellow
 }
+
 Write-Host "Starting Training with Feature Dimension: $NUM_NODES" -ForegroundColor Green
+
+$diffArgs = @()
+if ($USE_DIFFUSION) {
+    $diffArgs = @(
+        "--use_diffusion",
+        "--lambda_diff", $LAMBDA_DIFF,
+        "--lambda_rec", $LAMBDA_REC,
+        "--diffusion_steps", $DIFF_STEPS,
+        "--diffusion_eval_step", $DIFF_EVAL_STEP,
+        "--diffusion_dim", $DIFF_DIM,
+        "--diffusion_heads", $DIFF_HEADS,
+        "--diffusion_depth", $DIFF_DEPTH,
+        "--diffusion_beta_schedule", $DIFF_SCHEDULE,
+        "--diffusion_beta_start", $DIFF_BETA_START,
+        "--diffusion_beta_end", $DIFF_BETA_END
+    )
+}
+
 python -u run.py `
     --is_training 1 `
     --model $MODEL_NAME `
@@ -32,4 +65,5 @@ python -u run.py `
     --patience 10 `
     --revin 1 `
     --use_gpu True `
-    --gpu 0
+    --gpu 0 `
+    @diffArgs

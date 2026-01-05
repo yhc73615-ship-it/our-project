@@ -39,12 +39,12 @@ class Model(nn.Module):
             nn.Linear(self.seq_len * self.d_model, self.pre_len)
         )
 
-    def forward(self, x):
+    def forward(self, x, return_features: bool = False, return_x_norm: bool = False):
         # x: [bz, seq, d]
         balance_loss = 0
         contrastive_loss = []
-        x = self.revin_layer(x, 'norm')
-        out = self.start_fc(x.unsqueeze(-1))  # out: [bz, seq, d, d_model]
+        x_norm = self.revin_layer(x, 'norm')
+        out = self.start_fc(x_norm.unsqueeze(-1))  # out: [bz, seq, d, d_model]
 
         batch_size = x.shape[0]
         
@@ -52,7 +52,8 @@ class Model(nn.Module):
             out, aux_loss, con_loss = layer(out)
             balance_loss += aux_loss
             contrastive_loss.append(con_loss)
-                
+
+        cond_features = out
         out = out.permute(0,2,1,3).reshape(batch_size, self.num_nodes, -1)
         out = self.projections(out).transpose(2, 1)
 
@@ -61,5 +62,6 @@ class Model(nn.Module):
         contrastive_loss = torch.stack(contrastive_loss)
         contrastive_loss = torch.mean(contrastive_loss)
 
+        if return_features or return_x_norm:
+            return out, balance_loss, contrastive_loss, cond_features, (x_norm if return_x_norm else None)
         return out, balance_loss, contrastive_loss
-
