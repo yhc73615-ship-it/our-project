@@ -274,6 +274,8 @@ class Exp_Anomaly_Detection(Exp_Basic):
     def test(self, setting, test=0):
         test_data, test_loader = self._get_data(flag='test')
         train_data, train_loader = self._get_data(flag='train')
+        val_data, val_loader = self._get_data(flag='val')
+        threshold_mode = getattr(self.args, 'threshold_mode', 'train_test')
 
         if test:
             print('loading model')
@@ -323,6 +325,35 @@ class Exp_Anomaly_Detection(Exp_Basic):
         attens_energy = np.concatenate(attens_energy, axis=0).reshape(-1)
         train_energy = np.array(attens_energy)
 
+        val_energy = []
+        if threshold_mode == 'val_test':
+            with torch.no_grad():
+                for i, (batch_x, batch_y, _, _) in enumerate(val_loader):
+                    batch_x = batch_x.float().to(self.device)
+                    if self.use_diffusion:
+                        outputs, _, _, cond_feats, x_norm = self.model(
+                            batch_x, return_features=True, return_x_norm=True
+                        )
+                        t_eval = min(getattr(self.args, 'diffusion_eval_step', t_eval_default), t_eval_default)
+                        t_tensor = torch.full((batch_x.size(0),), t_eval, device=self.device, dtype=torch.long)
+                        noise = torch.randn_like(x_norm)
+                        alpha_bar = self.diffusion.alpha_bars[t_eval]
+                        z_t = torch.sqrt(alpha_bar) * x_norm + torch.sqrt(1 - alpha_bar) * noise
+                        cond_flat = cond_feats.view(cond_feats.shape[0], cond_feats.shape[1], -1)
+                        eps_pred = self.diffusion(z_t, t_tensor, cond_flat)
+                        x0_pred = (z_t - torch.sqrt(1 - alpha_bar) * eps_pred) / torch.sqrt(alpha_bar)
+                        recon = self.model.revin_layer(x0_pred, 'denorm')
+                    else:
+                        outputs, _, _ = self.model(batch_x)
+                        recon = outputs
+
+                    score = torch.mean(self.anomaly_criterion(batch_x, recon), dim=-1)
+                    score = score.detach().cpu().numpy()
+                    val_energy.append(score)
+
+            val_energy = np.concatenate(val_energy, axis=0).reshape(-1)
+            val_energy = np.array(val_energy)
+
         # (2) find the threshold
         attens_energy = []
         test_labels = []
@@ -357,9 +388,14 @@ class Exp_Anomaly_Detection(Exp_Basic):
 
         attens_energy = np.concatenate(attens_energy, axis=0).reshape(-1)
         test_energy = np.array(attens_energy)
-        combined_energy = np.concatenate([train_energy, test_energy], axis=0)
+        if threshold_mode == 'test_only':
+            combined_energy = test_energy
+        elif threshold_mode == 'val_test':
+            combined_energy = np.concatenate([val_energy, test_energy], axis=0)
+        else:
+            combined_energy = np.concatenate([train_energy, test_energy], axis=0)
         threshold = np.percentile(combined_energy, 100 - self.args.anomaly_ratio)
-        print('Threshold :', threshold)
+        print('Threshold mode:', threshold_mode, 'Threshold :', threshold)
 
         # (3) evaluation on the test set
         pred = (test_energy > threshold).astype(int)

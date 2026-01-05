@@ -65,6 +65,8 @@ if __name__ == '__main__':
     parser.add_argument('--diffusion_eval_step', type=int, default=50, help='timestep used for inference-time noising')
     parser.add_argument('--lambda_diff', type=float, default=1.0, help='weight for diffusion noise prediction loss')
     parser.add_argument('--lambda_rec', type=float, default=0.0, help='weight for conditional reconstruction head loss')
+    parser.add_argument('--threshold_mode', type=str, default='train_test',
+                        help='threshold source: train_test | test_only | val_test')
     
     # anomaly detection task
     parser.add_argument('--anomaly_ratio', type=float, default=3, help='prior anomaly ratio (%)')
