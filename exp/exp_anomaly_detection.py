@@ -17,6 +17,7 @@ import time
 import warnings
 import numpy as np
 import torch.nn.functional as F
+import math
 
 warnings.filterwarnings('ignore')
 
@@ -69,6 +70,73 @@ class Exp_Anomaly_Detection(Exp_Basic):
     def _select_criterion(self):
         criterion = nn.MSELoss()
         return criterion
+
+    def _ddim_denoise(self, x_norm, cond_flat):
+        """
+        DDIM sampling from noisy x_norm back to clean signal.
+        """
+        steps = min(getattr(self.args, 'ddim_steps', 20), self.diffusion.timesteps)
+        eta = getattr(self.args, 'ddim_eta', 0.0)
+        t_seq = torch.linspace(self.diffusion.timesteps - 1, 0, steps, device=self.device).long()
+        t_start = t_seq[0].item()
+
+        noise = torch.randn_like(x_norm)
+        alpha_bar_start = self.diffusion.alpha_bars[t_start].view(1, 1, 1)
+        x_t = torch.sqrt(alpha_bar_start) * x_norm + torch.sqrt(1 - alpha_bar_start) * noise
+
+        for idx, t in enumerate(t_seq):
+            t_int = t.item()
+            t_batch = torch.full((x_norm.size(0),), t_int, device=self.device, dtype=torch.long)
+            eps_pred = self.diffusion(x_t, t_batch, cond_flat)
+
+            alpha_bar_t = self.diffusion.alpha_bars[t_int].view(1, 1, 1)
+            alpha_t = self.diffusion.alphas[t_int].view(1, 1, 1)
+
+            if idx < len(t_seq) - 1:
+                t_prev = t_seq[idx + 1].item()
+                alpha_bar_prev = self.diffusion.alpha_bars[t_prev].view(1, 1, 1)
+                sigma_t = eta * torch.sqrt(
+                    torch.clamp((1 - alpha_bar_prev) / (1 - alpha_bar_t) * (1 - alpha_t / alpha_bar_prev), min=0.0)
+                )
+            else:
+                alpha_bar_prev = torch.ones_like(alpha_bar_t)
+                sigma_t = torch.zeros_like(alpha_bar_t)
+
+            pred_x0 = (x_t - torch.sqrt(1 - alpha_bar_t) * eps_pred) / torch.sqrt(alpha_bar_t)
+
+            if idx < len(t_seq) - 1:
+                c1 = torch.sqrt(alpha_bar_prev)
+                c2 = torch.sqrt(torch.clamp(1 - alpha_bar_prev - sigma_t ** 2, min=0.0))
+                noise = torch.randn_like(x_t)
+                x_t = c1 * pred_x0 + c2 * eps_pred + sigma_t * noise
+            else:
+                x_t = pred_x0
+
+        return x_t
+
+    def _reconstruct_batch(self, batch_x, t_eval_default, sampling_mode):
+        batch_x = batch_x.float().to(self.device)
+        if self.use_diffusion:
+            outputs, _, _, cond_feats, x_norm = self.model(
+                batch_x, return_features=True, return_x_norm=True
+            )
+            cond_flat = cond_feats.view(cond_feats.shape[0], cond_feats.shape[1], -1)
+            if sampling_mode == 'ddim':
+                recon_norm = self._ddim_denoise(x_norm, cond_flat)
+            else:
+                t_eval = min(getattr(self.args, 'diffusion_eval_step', t_eval_default), t_eval_default)
+                t_tensor = torch.full((batch_x.size(0),), t_eval, device=self.device, dtype=torch.long)
+                noise = torch.randn_like(x_norm)
+                alpha_bar = self.diffusion.alpha_bars[t_eval]
+                z_t = torch.sqrt(alpha_bar) * x_norm + torch.sqrt(1 - alpha_bar) * noise
+                eps_pred = self.diffusion(z_t, t_tensor, cond_flat)
+                recon_norm = (z_t - torch.sqrt(1 - alpha_bar) * eps_pred) / torch.sqrt(alpha_bar)
+            revin_layer = self.model.module.revin_layer if hasattr(self.model, 'module') else self.model.revin_layer
+            recon = revin_layer(recon_norm, 'denorm')
+        else:
+            outputs, _, _ = self.model(batch_x)
+            recon = outputs
+        return recon
 
     def vali(self, vali_data, vali_loader, criterion):
         torch.cuda.empty_cache() 
@@ -145,6 +213,7 @@ class Exp_Anomaly_Detection(Exp_Basic):
         train_data, train_loader = self._get_data(flag='train')
         vali_data, vali_loader = self._get_data(flag='val')
         test_data, test_loader = self._get_data(flag='test')
+        accum_steps = max(1, getattr(self.args, 'accum_steps', 1))
 
         path = os.path.join(self.args.checkpoints, setting)
         if not os.path.exists(path):
@@ -153,6 +222,7 @@ class Exp_Anomaly_Detection(Exp_Basic):
         time_now = time.time()
 
         train_steps = len(train_loader)
+        eff_steps = math.ceil(train_steps / accum_steps)
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
 
         model_optim = self._select_optimizer()
@@ -162,7 +232,7 @@ class Exp_Anomaly_Detection(Exp_Basic):
             scaler = torch.cuda.amp.GradScaler()
 
         scheduler = lr_scheduler.OneCycleLR(optimizer=model_optim,
-                                            steps_per_epoch=train_steps,
+                                            steps_per_epoch=eff_steps,
                                             pct_start=self.args.pct_start,
                                             epochs=self.args.train_epochs,
                                             max_lr=self.args.learning_rate)
@@ -178,7 +248,8 @@ class Exp_Anomaly_Detection(Exp_Basic):
             epoch_time = time.time()
             for i, (batch_x, _, _, _) in enumerate(train_loader):
                 iter_count += 1
-                model_optim.zero_grad()
+                if i % accum_steps == 0:
+                    model_optim.zero_grad()
 
                 batch_x = batch_x.float().to(self.device)
 
@@ -237,16 +308,31 @@ class Exp_Anomaly_Detection(Exp_Basic):
                     iter_count = 0
                     time_now = time.time()
 
-                loss.backward()
-                params_to_clip = list(self.model.parameters())
-                if self.diffusion is not None:
-                    params_to_clip += list(self.diffusion.parameters())
-                torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=4.0)
-                model_optim.step()
-                
-                if self.args.lradj == 'TST':
-                    adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, printout=False)
-                    scheduler.step()
+                step_now = ((i + 1) % accum_steps == 0) or (i + 1 == train_steps)
+                if self.args.use_amp:
+                    scaler.scale(loss / accum_steps).backward()
+                    if step_now:
+                        scaler.unscale_(model_optim)
+                        params_to_clip = list(self.model.parameters())
+                        if self.diffusion is not None:
+                            params_to_clip += list(self.diffusion.parameters())
+                        torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=4.0)
+                        scaler.step(model_optim)
+                        scaler.update()
+                        if self.args.lradj == 'TST':
+                            adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, printout=False)
+                            scheduler.step()
+                else:
+                    (loss / accum_steps).backward()
+                    if step_now:
+                        params_to_clip = list(self.model.parameters())
+                        if self.diffusion is not None:
+                            params_to_clip += list(self.diffusion.parameters())
+                        torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=4.0)
+                        model_optim.step()
+                        if self.args.lradj == 'TST':
+                            adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, printout=False)
+                            scheduler.step()
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
@@ -276,6 +362,7 @@ class Exp_Anomaly_Detection(Exp_Basic):
         train_data, train_loader = self._get_data(flag='train')
         val_data, val_loader = self._get_data(flag='val')
         threshold_mode = getattr(self.args, 'threshold_mode', 'train_test')
+        sampling_mode = getattr(self.args, 'diffusion_sampling', 'one_step')
 
         if test:
             print('loading model')
@@ -300,25 +387,8 @@ class Exp_Anomaly_Detection(Exp_Basic):
         # (1) stastic on the train set
         with torch.no_grad():
             for i, (batch_x, batch_y, _, _) in enumerate(train_loader):
-                batch_x = batch_x.float().to(self.device)
-                if self.use_diffusion:
-                    outputs, _, _, cond_feats, x_norm = self.model(
-                        batch_x, return_features=True, return_x_norm=True
-                    )
-                    t_eval = min(getattr(self.args, 'diffusion_eval_step', t_eval_default), t_eval_default)
-                    t_tensor = torch.full((batch_x.size(0),), t_eval, device=self.device, dtype=torch.long)
-                    noise = torch.randn_like(x_norm)
-                    alpha_bar = self.diffusion.alpha_bars[t_eval]
-                    z_t = torch.sqrt(alpha_bar) * x_norm + torch.sqrt(1 - alpha_bar) * noise
-                    cond_flat = cond_feats.view(cond_feats.shape[0], cond_feats.shape[1], -1)
-                    eps_pred = self.diffusion(z_t, t_tensor, cond_flat)
-                    x0_pred = (z_t - torch.sqrt(1 - alpha_bar) * eps_pred) / torch.sqrt(alpha_bar)
-                    recon = self.model.revin_layer(x0_pred, 'denorm')
-                else:
-                    outputs, _, _ = self.model(batch_x)
-                    recon = outputs
-
-                score = torch.mean(self.anomaly_criterion(batch_x, recon), dim=-1)
+                recon = self._reconstruct_batch(batch_x, t_eval_default, sampling_mode)
+                score = torch.mean(self.anomaly_criterion(batch_x.float().to(self.device), recon), dim=-1)
                 score = score.detach().cpu().numpy()
                 attens_energy.append(score)
 
@@ -329,25 +399,8 @@ class Exp_Anomaly_Detection(Exp_Basic):
         if threshold_mode == 'val_test':
             with torch.no_grad():
                 for i, (batch_x, batch_y, _, _) in enumerate(val_loader):
-                    batch_x = batch_x.float().to(self.device)
-                    if self.use_diffusion:
-                        outputs, _, _, cond_feats, x_norm = self.model(
-                            batch_x, return_features=True, return_x_norm=True
-                        )
-                        t_eval = min(getattr(self.args, 'diffusion_eval_step', t_eval_default), t_eval_default)
-                        t_tensor = torch.full((batch_x.size(0),), t_eval, device=self.device, dtype=torch.long)
-                        noise = torch.randn_like(x_norm)
-                        alpha_bar = self.diffusion.alpha_bars[t_eval]
-                        z_t = torch.sqrt(alpha_bar) * x_norm + torch.sqrt(1 - alpha_bar) * noise
-                        cond_flat = cond_feats.view(cond_feats.shape[0], cond_feats.shape[1], -1)
-                        eps_pred = self.diffusion(z_t, t_tensor, cond_flat)
-                        x0_pred = (z_t - torch.sqrt(1 - alpha_bar) * eps_pred) / torch.sqrt(alpha_bar)
-                        recon = self.model.revin_layer(x0_pred, 'denorm')
-                    else:
-                        outputs, _, _ = self.model(batch_x)
-                        recon = outputs
-
-                    score = torch.mean(self.anomaly_criterion(batch_x, recon), dim=-1)
+                    recon = self._reconstruct_batch(batch_x, t_eval_default, sampling_mode)
+                    score = torch.mean(self.anomaly_criterion(batch_x.float().to(self.device), recon), dim=-1)
                     score = score.detach().cpu().numpy()
                     val_energy.append(score)
 
@@ -361,25 +414,8 @@ class Exp_Anomaly_Detection(Exp_Basic):
 
         with torch.no_grad():
             for i, (batch_x, batch_y, _, _) in enumerate(test_loader):
-                batch_x = batch_x.float().to(self.device)
-                if self.use_diffusion:
-                    outputs, _, _, cond_feats, x_norm = self.model(
-                        batch_x, return_features=True, return_x_norm=True
-                    )
-                    t_eval = min(getattr(self.args, 'diffusion_eval_step', t_eval_default), t_eval_default)
-                    t_tensor = torch.full((batch_x.size(0),), t_eval, device=self.device, dtype=torch.long)
-                    noise = torch.randn_like(x_norm)
-                    alpha_bar = self.diffusion.alpha_bars[t_eval]
-                    z_t = torch.sqrt(alpha_bar) * x_norm + torch.sqrt(1 - alpha_bar) * noise
-                    cond_flat = cond_feats.view(cond_feats.shape[0], cond_feats.shape[1], -1)
-                    eps_pred = self.diffusion(z_t, t_tensor, cond_flat)
-                    x0_pred = (z_t - torch.sqrt(1 - alpha_bar) * eps_pred) / torch.sqrt(alpha_bar)
-                    recon = self.model.revin_layer(x0_pred, 'denorm')
-                else:
-                    outputs, _, _ = self.model(batch_x)
-                    recon = outputs
-
-                score = torch.mean(self.anomaly_criterion(batch_x, recon), dim=-1)
+                recon = self._reconstruct_batch(batch_x, t_eval_default, sampling_mode)
+                score = torch.mean(self.anomaly_criterion(batch_x.float().to(self.device), recon), dim=-1)
                 score = score.detach().cpu().numpy()
                 attens_energy.append(score)
                 test_labels.append(batch_y)

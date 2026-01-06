@@ -1,26 +1,30 @@
 $MODEL_NAME = "MTCL"
-$DATA_TYPE = "ALFA_ad"
+$DATA_TYPE = "FD"
 $NUM_NODES = 13
 $SEQ_LEN = 96
 $PRED_LEN = 96
 $BATCH_SIZE = 128
-$TRAIN_EPOCHS = 12
+$TRAIN_EPOCHS = 15
 $LEARNING_RATE = 0.001
-$DATA_ROOT = "./dataset/ALFA/"
+$DATA_ROOT = "./dataset/FD/"
 
 # Diffusion toggles (set $USE_DIFFUSION to $true to enable)
 $USE_DIFFUSION = $true
 $LAMBDA_DIFF = 1.0
-$LAMBDA_REC = 0.0
-$DIFF_STEPS = 100
-$DIFF_EVAL_STEP = 50
-$DIFF_DIM = 64
-$DIFF_HEADS = 4
+$LAMBDA_REC = 0.05
+$DIFF_STEPS = 60
+$DIFF_EVAL_STEP = 30
+$DIFF_DIM = 96
+$DIFF_HEADS = 6
 $DIFF_DEPTH = 3
-$DIFF_SCHEDULE = "linear"
+$DIFF_SCHEDULE = "cosine"
 $DIFF_BETA_START = 0.0001
 $DIFF_BETA_END = 0.02
-$THRESHOLD_MODE = "val_test" # options: train_test | test_only | val_test
+$DIFFUSION_SAMPLING = "ddim"
+$DDIM_STEPS = 20
+$DDIM_ETA = 0.0
+$ACCUM_STEPS = 2
+$THRESHOLD_MODE = "train_test" # options: train_test | test_only | val_test
 
 if (-not (Test-Path $DATA_ROOT)) {
     Write-Host "Warning: Data directory $DATA_ROOT does not exist." -ForegroundColor Yellow
@@ -41,7 +45,11 @@ if ($USE_DIFFUSION) {
         "--diffusion_depth", $DIFF_DEPTH,
         "--diffusion_beta_schedule", $DIFF_SCHEDULE,
         "--diffusion_beta_start", $DIFF_BETA_START,
-        "--diffusion_beta_end", $DIFF_BETA_END
+        "--diffusion_beta_end", $DIFF_BETA_END,
+        "--diffusion_sampling", $DIFFUSION_SAMPLING,
+        "--ddim_steps", $DDIM_STEPS,
+        "--ddim_eta", $DDIM_ETA,
+        "--accum_steps", $ACCUM_STEPS
     )
 }
 
