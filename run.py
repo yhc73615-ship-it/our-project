@@ -71,6 +71,36 @@ if __name__ == '__main__':
     parser.add_argument('--accum_steps', type=int, default=1, help='gradient accumulation steps')
     parser.add_argument('--threshold_mode', type=str, default='train_test',
                         help='threshold source: train_test | test_only | val_test')
+    parser.add_argument('--use_noise_score', action='store_true', default=False,
+                        help='use single-step noise score instead of reconstruction error for anomaly scoring')
+    parser.add_argument('--use_evt', action='store_true', default=False,
+                        help='use EVT (GPD) to set threshold on anomaly scores')
+    parser.add_argument('--evt_tail_frac', type=float, default=0.1,
+                        help='fraction of tail samples to fit EVT on combined scores')
+    parser.add_argument('--evt_conf', type=float, default=0.99,
+                        help='confidence level for EVT threshold (e.g., 0.99)')
+    parser.add_argument('--noise_score_mode', type=str, default='l2',
+                        help='noise score mode when use_noise_score: l2 | ebm | knn')
+    parser.add_argument('--use_ebm', action='store_true', default=False,
+                        help='enable EBM branch for noise scoring')
+    parser.add_argument('--lambda_ebm', type=float, default=0.1,
+                        help='weight for EBM loss')
+    parser.add_argument('--ebm_hidden', type=int, default=64,
+                        help='hidden dimension for EBM scorer')
+    parser.add_argument('--knn_k', type=int, default=5,
+                        help='k for kNN memory bank scoring')
+    parser.add_argument('--knn_max_samples', type=int, default=50000,
+                        help='max samples to keep in kNN memory bank')
+    parser.add_argument('--use_graph', action='store_true', default=False,
+                        help='enable adaptive graph dependency modeling')
+    parser.add_argument('--graph_dynamic', action='store_true', default=False,
+                        help='use data-dependent dynamic adjacency')
+    parser.add_argument('--graph_emb_dim', type=int, default=8,
+                        help='node embedding dim for adaptive graph')
+    parser.add_argument('--graph_dropout', type=float, default=0.0,
+                        help='dropout for adaptive graph adjacency')
+    parser.add_argument('--graph_alpha', type=float, default=0.1,
+                        help='strength for dynamic adjacency term')
     
     # anomaly detection task
     parser.add_argument('--anomaly_ratio', type=float, default=3, help='prior anomaly ratio (%)')

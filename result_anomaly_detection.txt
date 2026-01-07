@@ -1,11 +1,8 @@
 FD
-test_bs128_sl96_dm16_df16_ln4_k2_embtimeF_ar3.0_lr0.0001_pt10_te12_bn1_0  
-Accuracy : 0.8782, Precision : 0.9745, Recall : 0.8676, F-score : 0.9179
+test_bs128_sl96_dm16_df16_ln4_k2_embtimeF_ar5.0_lr0.0003_pt5_te20_bn1_0  
+Accuracy : 0.9849, Precision : 0.9859, Recall : 0.9959, F-score : 0.9909   
 ALFA
 (train_test)
-test_bs128_sl96_dm16_df16_ln4_k2_embtimeF_ar3.0_lr0.001_pt10_te15_bn1_0  
-Accuracy : 0.9876, Precision : 0.9859, Recall : 0.9902, F-score : 0.9880
-
-test_bs128_sl96_dm16_df16_ln4_k2_embtimeF_ar3.0_lr0.001_pt10_te15_bn1_0  
-Accuracy : 0.8899, Precision : 0.9838, Recall : 0.8742, F-score : 0.9258
+test_bs128_sl96_dm16_df16_ln4_k2_embtimeF_ar4.0_lr0.0003_pt5_te20_bn1_0  
+Accuracy : 0.9998, Precision : 0.9996, Recall : 1.0000, F-score : 0.9998
 

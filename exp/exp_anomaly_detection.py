@@ -6,6 +6,7 @@ from sklearn.metrics import accuracy_score, confusion_matrix
 import torch.multiprocessing
 from models import MTCL
 from models.diffusion import ConditionalDiffusion
+from models.ebm import EBMScorer
 from torch.optim import lr_scheduler
 
 torch.multiprocessing.set_sharing_strategy('file_system')
@@ -18,6 +19,8 @@ import warnings
 import numpy as np
 import torch.nn.functional as F
 import math
+from scipy.stats import genpareto
+from sklearn.neighbors import NearestNeighbors
 
 warnings.filterwarnings('ignore')
 
@@ -29,6 +32,8 @@ class Exp_Anomaly_Detection(Exp_Basic):
         self.val_losses = []
         self.lambda_contrastive = args.lambda_contrastive
         self.use_diffusion = getattr(args, 'use_diffusion', False)
+        self.use_ebm = getattr(args, 'use_ebm', False)
+        self.knn_index = None
         if self.use_diffusion:
             cond_dim = args.num_nodes * args.d_model
             self.diffusion = ConditionalDiffusion(
@@ -45,6 +50,11 @@ class Exp_Anomaly_Detection(Exp_Basic):
             ).to(self.device)
         else:
             self.diffusion = None
+        if self.use_ebm:
+            self.ebm = EBMScorer(input_dim=args.num_nodes,
+                                 hidden_dim=getattr(args, 'ebm_hidden', 64)).to(self.device)
+        else:
+            self.ebm = None
         
     def _build_model(self):
         model_dict = {
@@ -64,6 +74,8 @@ class Exp_Anomaly_Detection(Exp_Basic):
         params = list(self.model.parameters())
         if self.diffusion is not None:
             params += list(self.diffusion.parameters())
+        if self.ebm is not None:
+            params += list(self.ebm.parameters())
         model_optim = optim.Adam(params, lr=self.args.learning_rate)
         return model_optim
 
@@ -138,12 +150,73 @@ class Exp_Anomaly_Detection(Exp_Basic):
             recon = outputs
         return recon
 
+    def _noise_score_batch(self, batch_x):
+        """
+        Single-step noise score: predict noise at small t and take L2 energy.
+        """
+        return self._noise_score_batch_mode(batch_x, score_mode='l2')
+
+    def _noise_feature_batch(self, batch_x):
+        batch_x = batch_x.float().to(self.device)
+        if not (self.use_diffusion and self.diffusion is not None):
+            return None, None
+        t_noise = min(1, self.diffusion.timesteps - 1)
+        outputs, _, _, cond_feats, x_norm = self.model(
+            batch_x, return_features=True, return_x_norm=True
+        )
+        cond_flat = cond_feats.view(cond_feats.shape[0], cond_feats.shape[1], -1)
+        t_tensor = torch.full((batch_x.size(0),), t_noise, device=self.device, dtype=torch.long)
+        alpha_bar = self.diffusion.alpha_bars[t_noise]
+        noise = torch.randn_like(x_norm)
+        z_t = torch.sqrt(alpha_bar) * x_norm + torch.sqrt(1 - alpha_bar) * noise
+        eps_pred = self.diffusion(z_t, t_tensor, cond_flat)
+        l2_score = torch.mean(eps_pred ** 2, dim=(1, 2))
+        feat = eps_pred.mean(dim=1)
+        return l2_score, feat
+
+    def _noise_score_batch_mode(self, batch_x, score_mode='l2'):
+        l2_score, feat = self._noise_feature_batch(batch_x)
+        if l2_score is None:
+            return None
+        if score_mode == 'ebm':
+            if self.ebm is None:
+                return l2_score.detach().cpu().numpy()
+            energy = self.ebm(feat)
+            return energy.detach().cpu().numpy()
+        if score_mode == 'knn':
+            if self.knn_index is None:
+                return l2_score.detach().cpu().numpy()
+            feat_np = feat.detach().cpu().numpy()
+            dists, _ = self.knn_index.kneighbors(feat_np, return_distance=True)
+            return dists.mean(axis=1)
+        return l2_score.detach().cpu().numpy()
+
+    def _build_knn_index(self, train_loader, max_samples=50000, knn_k=5):
+        feats = []
+        with torch.no_grad():
+            for batch_x, _, _, _ in train_loader:
+                _, feat = self._noise_feature_batch(batch_x)
+                if feat is None:
+                    continue
+                feats.append(feat.detach().cpu().numpy())
+        if not feats:
+            return
+        feats = np.concatenate(feats, axis=0)
+        if feats.shape[0] > max_samples:
+            idx = np.random.choice(feats.shape[0], size=max_samples, replace=False)
+            feats = feats[idx]
+        knn_k = max(1, min(knn_k, feats.shape[0]))
+        self.knn_index = NearestNeighbors(n_neighbors=knn_k)
+        self.knn_index.fit(feats)
+
     def vali(self, vali_data, vali_loader, criterion):
         torch.cuda.empty_cache() 
         total_loss = []
         self.model.eval()
         if self.diffusion is not None:
             self.diffusion.eval()
+        if self.ebm is not None:
+            self.ebm.eval()
         with torch.no_grad():
             for i, (batch_x, _, _, _) in enumerate(vali_loader):
                 batch_x = batch_x.float().to(self.device)
@@ -199,6 +272,13 @@ class Exp_Anomaly_Detection(Exp_Basic):
                         rec_pred = self.diffusion.reconstruct_from_cond(cond_flat)
                         rec_loss = criterion(rec_pred, x_norm)
                         loss = loss + self.args.lambda_rec * rec_loss
+                    if self.use_ebm and self.ebm is not None:
+                        t0 = torch.zeros(batch_x.size(0), device=self.device, dtype=torch.long)
+                        eps_pos = self.diffusion(x_norm, t0, cond_flat)
+                        feat_pos = eps_pos.mean(dim=1)
+                        feat_neg = eps_pred.mean(dim=1)
+                        ebm_loss = (self.ebm(feat_pos) - self.ebm(feat_neg)).mean()
+                        loss = loss + self.args.lambda_ebm * ebm_loss
                 
                 total_loss.append(loss.item())
 
@@ -245,6 +325,8 @@ class Exp_Anomaly_Detection(Exp_Basic):
             train_contrastive_loss = []
 
             self.model.train()
+            if self.ebm is not None:
+                self.ebm.train()
             epoch_time = time.time()
             for i, (batch_x, _, _, _) in enumerate(train_loader):
                 iter_count += 1
@@ -272,6 +354,7 @@ class Exp_Anomaly_Detection(Exp_Basic):
 
                 diff_loss = torch.tensor(0.0, device=self.device)
                 rec_loss = torch.tensor(0.0, device=self.device)
+                ebm_loss = torch.tensor(0.0, device=self.device)
                 if self.use_diffusion:
                     t = torch.randint(
                         low=0,
@@ -292,6 +375,14 @@ class Exp_Anomaly_Detection(Exp_Basic):
                         rec_pred = self.diffusion.reconstruct_from_cond(cond_flat)
                         rec_loss = criterion(rec_pred, x_norm)
                         loss = loss + self.args.lambda_rec * rec_loss
+
+                    if self.use_ebm and self.ebm is not None:
+                        t0 = torch.zeros(batch_x.size(0), device=self.device, dtype=torch.long)
+                        eps_pos = self.diffusion(x_norm, t0, cond_flat)
+                        feat_pos = eps_pos.mean(dim=1)
+                        feat_neg = eps_pred.mean(dim=1)
+                        ebm_loss = (self.ebm(feat_pos) - self.ebm(feat_neg)).mean()
+                        loss = loss + self.args.lambda_ebm * ebm_loss
 
                 train_loss.append(loss.item())
                 self.train_losses.append(loss.item())
@@ -354,6 +445,9 @@ class Exp_Anomaly_Detection(Exp_Basic):
         if self.diffusion is not None:
             diffusion_path = path + '/' + 'diffusion.pth'
             torch.save(self.diffusion.state_dict(), diffusion_path)
+        if self.ebm is not None:
+            ebm_path = path + '/' + 'ebm.pth'
+            torch.save(self.ebm.state_dict(), ebm_path)
 
         return self.model
 
@@ -363,6 +457,11 @@ class Exp_Anomaly_Detection(Exp_Basic):
         val_data, val_loader = self._get_data(flag='val')
         threshold_mode = getattr(self.args, 'threshold_mode', 'train_test')
         sampling_mode = getattr(self.args, 'diffusion_sampling', 'one_step')
+        use_noise_score = getattr(self.args, 'use_noise_score', False)
+        use_evt = getattr(self.args, 'use_evt', False)
+        evt_tail_frac = max(0.01, min(0.5, getattr(self.args, 'evt_tail_frac', 0.1)))
+        evt_conf = max(0.9, min(0.999, getattr(self.args, 'evt_conf', 0.99)))
+        noise_score_mode = getattr(self.args, 'noise_score_mode', 'l2')
 
         if test:
             print('loading model')
@@ -371,6 +470,10 @@ class Exp_Anomaly_Detection(Exp_Basic):
                 diffusion_path = os.path.join('./checkpoints/' + setting, 'diffusion.pth')
                 if os.path.exists(diffusion_path):
                     self.diffusion.load_state_dict(torch.load(diffusion_path, map_location=self.device))
+            if self.ebm is not None:
+                ebm_path = os.path.join('./checkpoints/' + setting, 'ebm.pth')
+                if os.path.exists(ebm_path):
+                    self.ebm.load_state_dict(torch.load(ebm_path, map_location=self.device))
 
         attens_energy = []
         folder_path = './test_results/' + setting + '/'
@@ -380,16 +483,33 @@ class Exp_Anomaly_Detection(Exp_Basic):
         self.model.eval()
         if self.diffusion is not None:
             self.diffusion.eval()
+        if self.ebm is not None:
+            self.ebm.eval()
         self.anomaly_criterion = nn.MSELoss(reduce=False)
 
         t_eval_default = self.diffusion.timesteps // 2 if self.diffusion is not None else 0
+        if use_noise_score and noise_score_mode == 'ebm' and self.ebm is None:
+            print('Warning: noise_score_mode=ebm but EBM is disabled; fallback to l2.')
+        if use_noise_score and noise_score_mode == 'knn' and self.use_diffusion:
+            self._build_knn_index(
+                train_loader,
+                max_samples=getattr(self.args, 'knn_max_samples', 50000),
+                knn_k=getattr(self.args, 'knn_k', 5)
+            )
+        if use_noise_score and noise_score_mode == 'knn' and self.knn_index is None:
+            print('Warning: kNN index not built; fallback to l2.')
 
         # (1) stastic on the train set
         with torch.no_grad():
             for i, (batch_x, batch_y, _, _) in enumerate(train_loader):
-                recon = self._reconstruct_batch(batch_x, t_eval_default, sampling_mode)
-                score = torch.mean(self.anomaly_criterion(batch_x.float().to(self.device), recon), dim=-1)
-                score = score.detach().cpu().numpy()
+                if use_noise_score:
+                    score = self._noise_score_batch_mode(batch_x, noise_score_mode)
+                    if score is None:
+                        recon = self._reconstruct_batch(batch_x, t_eval_default, sampling_mode)
+                        score = torch.mean(self.anomaly_criterion(batch_x.float().to(self.device), recon), dim=-1).detach().cpu().numpy()
+                else:
+                    recon = self._reconstruct_batch(batch_x, t_eval_default, sampling_mode)
+                    score = torch.mean(self.anomaly_criterion(batch_x.float().to(self.device), recon), dim=-1).detach().cpu().numpy()
                 attens_energy.append(score)
 
         attens_energy = np.concatenate(attens_energy, axis=0).reshape(-1)
@@ -399,9 +519,14 @@ class Exp_Anomaly_Detection(Exp_Basic):
         if threshold_mode == 'val_test':
             with torch.no_grad():
                 for i, (batch_x, batch_y, _, _) in enumerate(val_loader):
-                    recon = self._reconstruct_batch(batch_x, t_eval_default, sampling_mode)
-                    score = torch.mean(self.anomaly_criterion(batch_x.float().to(self.device), recon), dim=-1)
-                    score = score.detach().cpu().numpy()
+                    if use_noise_score:
+                        score = self._noise_score_batch_mode(batch_x, noise_score_mode)
+                        if score is None:
+                            recon = self._reconstruct_batch(batch_x, t_eval_default, sampling_mode)
+                            score = torch.mean(self.anomaly_criterion(batch_x.float().to(self.device), recon), dim=-1).detach().cpu().numpy()
+                    else:
+                        recon = self._reconstruct_batch(batch_x, t_eval_default, sampling_mode)
+                        score = torch.mean(self.anomaly_criterion(batch_x.float().to(self.device), recon), dim=-1).detach().cpu().numpy()
                     val_energy.append(score)
 
             val_energy = np.concatenate(val_energy, axis=0).reshape(-1)
@@ -414,11 +539,18 @@ class Exp_Anomaly_Detection(Exp_Basic):
 
         with torch.no_grad():
             for i, (batch_x, batch_y, _, _) in enumerate(test_loader):
-                recon = self._reconstruct_batch(batch_x, t_eval_default, sampling_mode)
-                score = torch.mean(self.anomaly_criterion(batch_x.float().to(self.device), recon), dim=-1)
-                score = score.detach().cpu().numpy()
+                if use_noise_score:
+                    score = self._noise_score_batch_mode(batch_x, noise_score_mode)
+                    if score is None:
+                        recon = self._reconstruct_batch(batch_x, t_eval_default, sampling_mode)
+                        score = torch.mean(self.anomaly_criterion(batch_x.float().to(self.device), recon), dim=-1).detach().cpu().numpy()
+                else:
+                    recon = self._reconstruct_batch(batch_x, t_eval_default, sampling_mode)
+                    score = torch.mean(self.anomaly_criterion(batch_x.float().to(self.device), recon), dim=-1).detach().cpu().numpy()
                 attens_energy.append(score)
-                test_labels.append(batch_y)
+                # window-level labels: mark window as anomalous if any timestep is non-zero
+                batch_y_window = (batch_y.view(batch_y.shape[0], -1) != 0).any(dim=1).int().detach().cpu().numpy()
+                test_labels.append(batch_y_window)
                 batch_x = batch_x.detach().cpu().numpy()
                 test_data.append(batch_x)
 
@@ -430,17 +562,39 @@ class Exp_Anomaly_Detection(Exp_Basic):
             combined_energy = np.concatenate([val_energy, test_energy], axis=0)
         else:
             combined_energy = np.concatenate([train_energy, test_energy], axis=0)
-        threshold = np.percentile(combined_energy, 100 - self.args.anomaly_ratio)
+
+        if use_evt and combined_energy.size > 10:
+            tail_len = max(5, int(len(combined_energy) * evt_tail_frac))
+            tail = np.sort(combined_energy)[-tail_len:]
+            tail_min = tail.min()
+            tail_shift = tail - tail_min
+            try:
+                c, loc, scale = genpareto.fit(tail_shift, floc=0)
+                threshold = tail_min + genpareto.ppf(evt_conf, c, loc=0, scale=scale)
+                print('EVT threshold:', threshold, 'tail_frac:', evt_tail_frac, 'conf:', evt_conf)
+            except Exception as e:
+                threshold = np.percentile(combined_energy, 100 - self.args.anomaly_ratio)
+                print('EVT failed, fallback percentile. Err:', e)
+        else:
+            threshold = np.percentile(combined_energy, 100 - self.args.anomaly_ratio)
         print('Threshold mode:', threshold_mode, 'Threshold :', threshold)
 
         # (3) evaluation on the test set
         pred = (test_energy > threshold).astype(int)
-        test_labels = np.concatenate(test_labels, axis=0).reshape(-1)
+        test_labels = np.concatenate(test_labels, axis=0)
         test_labels = np.array(test_labels)
         gt = test_labels.astype(int)
 
+        # Align lengths if windowing causes mismatch
+        if pred.shape[0] != gt.shape[0]:
+            min_len = min(pred.shape[0], gt.shape[0])
+            print(f'Warning: pred/gt length mismatch {pred.shape[0]} vs {gt.shape[0]}, truncating to {min_len}')
+            pred = pred[:min_len]
+            gt = gt[:min_len]
+
         print('pred:   ', pred.shape)
         print('gt:     ', gt.shape)
+        print('Positive labels after windowing:', gt.sum())
 
         gt = np.where(gt != 0, 1, 0)
 
